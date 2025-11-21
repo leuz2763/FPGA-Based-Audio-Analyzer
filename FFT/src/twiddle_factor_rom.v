@@ -17,7 +17,7 @@ module twiddle_factor_rom #(
     parameter DATA_WIDTH = 48
 ) (
     input                       clk,
-    input                       rst_n, // Async low active Reset
+    input                       rst_n, // My mistake i put it active low while all other modules are active high, in the top entity i inverted it
     input      [ADDR_WIDTH-1:0] addr,
     output reg [DATA_WIDTH-1:0] twiddle_factor_q
 );

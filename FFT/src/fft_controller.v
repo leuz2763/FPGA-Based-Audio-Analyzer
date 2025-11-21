@@ -1,3 +1,25 @@
+/*******************************************************************************
+* Module: fft_controller
+* 
+* Description:
+* This module implements the main control logic for a Radix-2, Decimation-In-Time 
+* (DIT) FFT processor. It orchestrates data flow between memory and arithmetic units.
+*
+* Key Stages:
+* 1. **Data Loading & Bit Reversal**: Reads sequential time-domain samples from 
+*    the input interface and stores them into the Working RAM using bit-reversed 
+*    addressing to prepare for in-place computation.
+*
+* 2. **FFT Execution (Butterfly Loop)**: Manages the three-loop structure 
+*    (Stage, Group, Butterfly) required by the Cooley-Tukey algorithm. 
+*    - Generates read/write addresses for the Dual-Port RAM.
+*    - Fetches the correct coefficients from the Twiddle Factor ROM.
+*    - Handshakes with the external Butterfly Unit (Start/Valid protocol).
+*
+* 3. **Magnitude Post-Processing**: Sequentially reads the complex frequency 
+*    bins from RAM, passes them to the Magnitude Approximator, and streams 
+*    the final real-valued results to the output.
+******************************************************************************/
 module fft_controller #(
     parameter FFT_POINTS     = 512,
     parameter DATA_WIDTH     = 24,
@@ -5,9 +27,7 @@ module fft_controller #(
 ) (
     // Global Signals
     input wire                      clk,
-    input wire                      reset, // Sincronous Active High Reset
-
-    // Interfaces
+    input wire                      reset, 
 
     // Double Buffer Interface
     input wire                      i_data_ready,
@@ -78,19 +98,17 @@ module fft_controller #(
     wire [LOG2_FFT_POINTS-1:0] addr_a, addr_b;
     wire [LOG2_FFT_POINTS-1:0] twiddle_addr;
 
-    // m and m/2 calculation
+    // Logic for loop limits
+    wire [LOG2_FFT_POINTS-1:0] num_groups;
+    wire [LOG2_FFT_POINTS-1:0] bfly_per_group;
+
     assign m_half = 1'b1 << stage_reg;       
     assign m      = 1'b1 << (stage_reg + 1); 
 
     assign addr_a = (group_idx_reg * m) + bfly_idx_reg;
     assign addr_b = addr_a + m_half;
-    assign twiddle_addr = bfly_idx_reg * (FFT_POINTS >> (stage_reg + 1)); // FFT_POINTS / m
+    assign twiddle_addr = bfly_idx_reg * (FFT_POINTS >> (stage_reg + 1));
 
-    // Loop limits
-    // Not localparams because depend on stage_reg
-    wire [LOG2_FFT_POINTS-1:0] num_groups;
-    wire [LOG2_FFT_POINTS-1:0] bfly_per_group;
-    
     assign num_groups     = 1'b1 << (LOG2_FFT_POINTS - 1 - stage_reg);
     assign bfly_per_group = 1'b1 << stage_reg;
 
@@ -111,6 +129,7 @@ module fft_controller #(
             group_idx_reg    <= group_idx_next;
             bfly_idx_reg     <= bfly_idx_next;
 
+            // Store addresses used during compute for write-back
             if (state_reg == S_COMPUTE_START_BFY) begin
                 addr_a_reg <= addr_a;
                 addr_b_reg <= addr_b;
@@ -129,6 +148,7 @@ module fft_controller #(
 
     // Combinational logic
     always @(*) begin
+        // Defaults
         state_next          = state_reg;
         load_counter_next   = load_counter_reg;
         stage_next          = stage_reg;
@@ -157,6 +177,7 @@ module fft_controller #(
             S_LOAD_SAMPLES: begin
                 o_ram_wr_en_a   = 1'b1;
                 o_ram_addr_a    = bit_reversed_addr;
+                // Imaginary part set to 0
                 o_ram_data_in_a = {i_buffer_data_in, {DATA_WIDTH{1'b0}}};
                 
                 if (load_counter_reg == FFT_POINTS - 1) begin
@@ -181,6 +202,11 @@ module fft_controller #(
             end
             
             S_COMPUTE_START_BFY: begin
+                // Ensure addresses are stable during read
+                o_ram_addr_a        = addr_a; 
+                o_ram_addr_b        = addr_b;
+                o_twiddle_addr      = twiddle_addr;
+                
                 o_butterfly_start   = 1'b1;
                 state_next          = S_COMPUTE_WAIT_VALID;
             end
@@ -199,6 +225,7 @@ module fft_controller #(
                 o_ram_data_in_a = i_butterfly_a_out;
                 o_ram_data_in_b = i_butterfly_b_out;
 
+                // Loop Management
                 if (stage_reg == LOG2_FFT_POINTS - 1 && group_idx_reg == num_groups - 1 && bfly_idx_reg == bfly_per_group - 1) begin
                     state_next = S_MAG_READ_ADDR;
                     load_counter_next = 0; 
@@ -217,23 +244,33 @@ module fft_controller #(
                 end
             end
             
+            // --- MAGNITUDE CALCULATION PHASES ---
+            
             S_MAG_READ_ADDR: begin
                 o_ram_addr_a = load_counter_reg;
                 state_next   = S_MAG_START_CALC;
             end
 
             S_MAG_START_CALC: begin
+                // **FIX**: Keep address stable
+                o_ram_addr_a      = load_counter_reg;
                 o_magnitude_start = 1'b1;
                 state_next        = S_MAG_WAIT_VALID;
             end
             
             S_MAG_WAIT_VALID: begin
+                // **FIX**: Keep address stable so top level sees the correct bin index
+                o_ram_addr_a = load_counter_reg;
+                
                 if(i_magnitude_valid) begin
                     state_next = S_MAG_OUTPUT;
                 end
             end
             
             S_MAG_OUTPUT: begin
+                // **FIX**: Keep address stable for the validity strobe
+                o_ram_addr_a = load_counter_reg;
+                
                 if(load_counter_reg == FFT_POINTS - 1) begin
                     state_next = S_DONE;
                 end else begin
@@ -255,6 +292,8 @@ module fft_controller #(
     // Output Assignments
     assign o_fft_busy = (state_reg != S_IDLE);
     assign o_fft_done = (state_reg == S_DONE);
+    
+    // Pass through the magnitude result
     assign o_magnitude_out = i_magnitude_in;
 
 endmodule
